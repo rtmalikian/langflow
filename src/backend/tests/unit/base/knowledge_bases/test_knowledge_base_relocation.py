@@ -828,6 +828,46 @@ class TestRelocationToPostgresLive:
                 await source.delete_collection()
             await source.teardown()
 
+    async def test_failed_write_is_reported_without_the_chunks_it_carried(self, active_user, kb_root, tmp_path):
+        # Chroma stores a NUL byte and Postgres refuses one. SQLAlchemy's error quotes the
+        # statement with its parameters, which are the chunks of the batch, and the
+        # driver's own goes on to quote the metadata it could not take.
+        kb_name = f"kb_nul_{uuid.uuid4().hex[:6]}"
+        await _seed_chroma_kb(kb_root, active_user.username, kb_name, 2)
+        source = ChromaLocalBackend(kb_name=kb_name, kb_path=kb_root / active_user.username / kb_name)
+        try:
+            await source.add_embedded_documents(
+                [
+                    IngestedDocument(
+                        id="nul",
+                        content="private chunk text",
+                        metadata={"note": "private\x00note"},
+                        embedding=_vector(2, unit=True),
+                    )
+                ]
+            )
+        finally:
+            await source.teardown()
+        record = await knowledge_base_service.create_record(
+            user_id=active_user.id, name=kb_name, model_selection={"name": "m", "provider": "p"}, chunks=3
+        )
+        target = create_backend(
+            "postgres", kb_name=kb_name, kb_path=tmp_path, backend_config={}, user_id=active_user.id
+        )
+        try:
+            results = await relocate_knowledge_bases(target_backend_type="postgres", target_backend_config={})
+
+            result = next(r for r in results if r.kb_id == record.id)
+            assert (result.status, result.code) == ("failed", "kb_failed")
+            assert "private" not in result.reason
+            assert "doc 0" not in result.reason
+            assert result.reason == "UntranslatableCharacter: unsupported Unicode escape sequence"
+            assert (await knowledge_base_service.get_by_id(record.id)).backend_type == "chroma"
+        finally:
+            with contextlib.suppress(Exception):
+                await target.delete_collection()
+            await target.teardown()
+
     @pytest.mark.usefixtures("quiet_libraries")
     async def test_json_stream_of_a_real_run(self, active_user, kb_root, tmp_path: Path, capsys):
         model = {"name": "m", "provider": "p"}
