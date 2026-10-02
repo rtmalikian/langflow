@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from lfx.base.knowledge_bases.backends import BackendType, create_backend, get_backend_class
 from lfx.log.logger import logger
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlmodel import select
 
 from langflow.api.utils.kb_helpers import resolve_local_store_path
@@ -45,6 +45,15 @@ RelocationStatus = Literal["relocated", "would_relocate", "skipped", "failed"]
 _METRIC_SAMPLE_SIZE = 100
 _UNIT_NORM_TOLERANCE = 1e-3
 _OPENSEARCH_SPACE_TYPES = {"cosine": "cosinesimil", "l2": "l2", "inner_product": "innerproduct"}
+
+# What a write raises when the target cannot be reached, by the type each driver
+# has for it. Chroma has none, so a Chroma Cloud target that drops mid-copy reads
+# as any other failure.
+_UNREACHABLE: tuple[type[Exception], ...] = (OperationalError,)
+with suppress(ImportError):
+    from opensearchpy.exceptions import ConnectionError as OpenSearchConnectionError
+
+    _UNREACHABLE = (*_UNREACHABLE, OpenSearchConnectionError)
 
 # Some stores (OpenSearch) count newly written chunks only after a refresh, so
 # the post-copy count is polled briefly before a shortfall is treated as real.
@@ -226,7 +235,8 @@ async def _relocate_one(
                 result.code = "kb_no_vectors"
                 result.reason = "source returned chunks without vectors, so they can only be re-ingested"
                 return result
-            await target.add_embedded_documents(batch)
+            with _failing_as(result, "kb_target_unreachable", _UNREACHABLE):
+                await target.add_embedded_documents(batch)
             result.copied += len(batch)
             if on_progress:
                 on_progress(result)
@@ -313,11 +323,13 @@ def _describe(exc: Exception) -> str:
 
 
 @contextmanager
-def _failing_as(result: KBRelocationResult, code: str) -> Iterator[None]:
+def _failing_as(
+    result: KBRelocationResult, code: str, errors: type[Exception] | tuple[type[Exception], ...] = Exception
+) -> Iterator[None]:
     """Give a failure raised inside the block ``code``, unless a narrower block already named it."""
     try:
         yield
-    except Exception:
+    except errors:
         result.code = result.code or code
         raise
 
